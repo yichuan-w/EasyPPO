@@ -361,9 +361,15 @@ def compute_advantage(
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
 
+        # Filtered responses still count in group statistics, with zero reward.
+        # Keep the original judge scores for logging and defer actor loss masking.
+        grpo_rewards = data.batch["token_level_rewards"]
+        if "overlong_filtered" in data.batch:
+            grpo_rewards = grpo_rewards.masked_fill(data.batch["overlong_filtered"].bool().unsqueeze(-1), 0.0)
+
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
+            token_level_rewards=grpo_rewards,
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,

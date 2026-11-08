@@ -483,11 +483,10 @@ class PPOTrainer(ABC):
             # TransferQueue field writes return fresh metadata with persisted tags,
             # which do not include the local overlong_filtered annotations. Keep
             # stable keys across log-prob/advantage writes and DP batch reordering.
-            overlong_keys = []
-            if actor_only_overlong_filter:
-                overlong_keys = [
-                    key for key, tag in zip(batch.keys, batch.tags, strict=True) if tag.get("overlong_filtered", False)
-                ]
+            filtered_overlong_keys = [
+                key for key, tag in zip(batch.keys, batch.tags, strict=True) if tag.get("overlong_filtered", False)
+            ]
+            overlong_keys = filtered_overlong_keys if actor_only_overlong_filter else []
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
 
@@ -515,7 +514,7 @@ class PPOTrainer(ABC):
 
         # 7. compute advantage and return
         with marked_timer("adv", timing_raw, color="brown"):
-            batch = self._compute_advantage(batch, metrics=metrics)
+            batch = self._compute_advantage(batch, metrics=metrics, overlong_keys=filtered_overlong_keys)
 
         # 8. [OPTIONAL] update critic
         if self.use_critic:
@@ -1451,7 +1450,9 @@ class PPOTrainer(ABC):
 
         return batch
 
-    def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+    def _compute_advantage(
+        self, batch: KVBatchMeta, metrics: dict, overlong_keys: Optional[list[str]] = None
+    ) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
@@ -1460,6 +1461,14 @@ class PPOTrainer(ABC):
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+        if overlong_keys:
+            # Map stable keys after DP reordering; TransferQueue writes can drop tags.
+            overlong_key_set = set(overlong_keys)
+            data.batch["overlong_filtered"] = torch.tensor(
+                [key in overlong_key_set for key in batch.keys],
+                dtype=torch.bool,
+                device=data.batch["token_level_scores"].device,
+            )
 
         if self.config.critic.variance_weighted_loss:
             sequence_rewards = data.batch["token_level_scores"].sum(dim=-1)
